@@ -17,7 +17,7 @@
 #include <sys/stat.h>
 
 #define SERVPORT 53004 //no clue but its in the sample code from lab 0
-
+#define HEADER_BUF 8192 //header buffer size 8KB
 
 int main(int argc, char *argv[])
 {
@@ -37,7 +37,7 @@ int main(int argc, char *argv[])
     //if filepath is just '/', then filename should be index_html
     if (res == 0) 
     {
-        filename = "index_html";
+        filename = "index.html";
     } 
     
     else 
@@ -70,7 +70,6 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-
     their_addr.sin_family = AF_INET; //common address family from notes
 	their_addr.sin_port = htons(port); //port from argv[2]
 	their_addr.sin_addr = *((struct in_addr *)he->h_addr_list[0]); //server IP address
@@ -91,9 +90,10 @@ int main(int argc, char *argv[])
     */
 
     char request[1024]; //buffer to hold http request
-    snprintf(request, sizeof(request), "GET %s HTTP/1.0\r\nHost: %s:%d\r\n\r\n", filepath, host, port);
+    snprintf(request, sizeof(request), "GET %s HTTP/1.1\r\nHost: %s:%d\r\n\r\n", filepath, host, port);
     //used snprintf to format the request string
-    
+    //used 1.1 instead of 1.0 because some servers dont support 1.0
+
     if(send(sockfd, request, strlen(request), 0) < 0) { 
         //send http request to server, 0 is for flags parameter
         perror("send");
@@ -110,25 +110,88 @@ int main(int argc, char *argv[])
     [file content]
     */
     
-    int numbytes;
-    char str[1000]; //buffer to hold response from server
+    int numbytes; //number of bytes received
+    char headerbuf[HEADER_BUF];
+    int header_bytes = 0;
+    char *body = NULL;
 
-    if ((numbytes = recv(sockfd, str, 1000, 0)) < 0) { /* numbytes is the actual number of bytes received.
-                                                            * Note that numbytes may be smaller than the 
-                                                            * str buffer size (1000 bytes in this case).
-                                                            */
+    //read headers until we find \r\n\r\n
+    while (1) {
+        numbytes = recv(sockfd, headerbuf + header_bytes, sizeof(headerbuf) - header_bytes - 1, 0);
+        if (numbytes <= 0) {
             perror("recv");
             exit(1);
         }
-    str[numbytes] = '\0'; //null the received string
-    
-    //otherwise, print the response to stdout
+        header_bytes += numbytes;
+        headerbuf[header_bytes] = '\0';
 
-    // printf("\n");if (strstr(str, "DONE") != NULL) //break;
-    //     printf("%s", str);
-    // }
+        body = strstr(headerbuf, "\r\n\r\n");
+        if (body) {
+            body += 4; //move pointer to start of body
+            break;
+        }
+    }
 
-	// close(sockfd);
-    // return 0;
+    //need to check for "200 OK" in the first line of the response
+    char *first_line_end = strstr(headerbuf, "\r\n");
+    if (first_line_end != NULL) 
+    {
+        *first_line_end = '\0';
+        char *first_line = headerbuf;
+
+        if (strncmp(first_line, "HTTP/1.0 200 OK", 15) != 0 && strncmp(first_line, "HTTP/1.1 200 OK", 15) != 0) 
+        {
+            printf("%s\n", first_line);
+            close(sockfd);
+            exit(0);
+        }
+        *first_line_end = '\r'; //restore the original string
+    }
+
+    //extract "Content-Length" from headers
+    char *length_str = strstr(headerbuf, "Content-Length: ");
+    int content_length = 0;
+    if (length_str != NULL) {
+        sscanf(length_str, "Content-Length: %d", &content_length);
+    } else {
+        printf("Content-Length not found\n");
+        close(sockfd);
+        exit(1);
+    }
+
+    //now we open output file
+    FILE *fp = fopen(filename, "wb"); //open file in binary write mode
+    //wb is for write binary
+    if (fp == NULL) 
+    {
+        perror("fopen");
+        close(sockfd);
+        exit(1);
+    }
+
+    //write part of the body already in headerbuf to file
+    int header_length = body - headerbuf; //length of header part
+    int body_length = header_bytes - header_length; //length of body part already in buffer
+    int total_received = 0;
+
+    //write initial body part to file
+    if (body_length > 0) {
+        fwrite(body, 1, body_length, fp);
+        total_received = body_length;
+    }
+
+    //continue receiving the rest of the file
+    while (total_received < content_length) {
+        char buffer[4096];  //use separate buffer
+        numbytes = recv(sockfd, buffer, sizeof(buffer), 0); 
+        if (numbytes <= 0) {
+            break;
+        }
+        fwrite(buffer, 1, numbytes, fp);
+        total_received += numbytes;
+    }
+
+    fclose(fp);
+    close(sockfd);
+    return 0;
 }
-
